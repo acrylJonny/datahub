@@ -707,3 +707,13 @@
     displayName: SAP Analytics Cloud
     type: OTHERS
     logoUrl: "/assets/platforms/saclogo.svg"
+- entityUrn: urn:li:dataPlatform:soda
+  entityType: dataPlatform
+  aspectName: dataPlatformInfo
+  changeType: UPSERT
+  aspect:
+    datasetNameDelimiter: "."
+    name: soda
+    displayName: Soda.io
+    type: OTHERS
+    logoUrl: "/assets/platforms/sodalogo.svg"

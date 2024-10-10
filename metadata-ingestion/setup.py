@@ -456,6 +456,7 @@ plugins: Dict[str, Set[str]] = {
     "abs": {*abs_base, *data_lake_profiling},
     "sagemaker": aws_common,
     "salesforce": {"simple-salesforce"},
+    "soda": {"soda-core"},
     "snowflake": snowflake_common | usage_common | sqlglot_lib,
     "snowflake-summary": snowflake_common | usage_common | sqlglot_lib,
     "snowflake-queries": snowflake_common | usage_common | sqlglot_lib,
@@ -630,6 +631,7 @@ base_dev_requirements = {
             "qlik-sense",
             "sigma",
             "sac",
+            "soda",
         ]
         if plugin
         for dependency in plugins[plugin]
@@ -717,6 +719,7 @@ entry_points = {
         "postgres = datahub.ingestion.source.sql.postgres:PostgresSource",
         "redash = datahub.ingestion.source.redash:RedashSource",
         "redshift = datahub.ingestion.source.redshift.redshift:RedshiftSource",
+        "soda = datahub.ingestion.source.soda_dq:SodaSource",
         "slack = datahub.ingestion.source.slack.slack:SlackSource",
         "snowflake = datahub.ingestion.source.snowflake.snowflake_v2:SnowflakeV2Source",
         "snowflake-summary = datahub.ingestion.source.snowflake.snowflake_summary:SnowflakeSummarySource",

@@ -35,6 +35,7 @@ import csvLogo from '../../../../images/csv-logo.png';
 import qlikLogo from '../../../../images/qliklogo.png';
 import sigmaLogo from '../../../../images/sigmalogo.png';
 import sacLogo from '../../../../images/saclogo.svg';
+import sodaLogo from '../../../../images/sodalogo.svg';
 
 export const ATHENA = 'athena';
 export const ATHENA_URN = `urn:li:dataPlatform:${ATHENA}`;
@@ -125,6 +126,8 @@ export const SIGMA = 'sigma';
 export const SIGMA_URN = `urn:li:dataPlatform:${SIGMA}`;
 export const SAC = 'sac';
 export const SAC_URN = `urn:li:dataPlatform:${SAC}`;
+export const SODA = 'soda';
+export const SAC_URN = `urn:li:dataPlatform:${SODA}`;
 
 export const PLATFORM_URN_TO_LOGO = {
     [ATHENA_URN]: athenaLogo,
@@ -165,6 +168,7 @@ export const PLATFORM_URN_TO_LOGO = {
     [QLIK_SENSE_URN]: qlikLogo,
     [SIGMA_URN]: sigmaLogo,
     [SAC_URN]: sacLogo,
+    [SODA_URN]: sodaLogo,
 };
 
 export const SOURCE_TO_PLATFORM_URN = {
