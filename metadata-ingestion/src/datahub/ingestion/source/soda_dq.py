@@ -1,6 +1,6 @@
 import logging
-from typing import Dict, Iterable, Optional, List
-from dataclasses import dataclass
+from typing import Iterable
+from dataclasses import field
 from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
@@ -25,6 +25,108 @@ from datahub.metadata.schema_classes import (
 
 logger = logging.getLogger(__name__)
 
+from dataclasses import dataclass, fields, MISSING
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+def snake_to_camel(string: str) -> str:
+    components = string.split('_')
+    return components[0] + ''.join(x.title() for x in components[1:])
+
+def camel_to_snake(string: str) -> str:
+    return ''.join(['_' + char.lower() if char.isupper() else char for char in string]).lstrip('_')
+
+class DynamicConversion:
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Any:
+        field_dict = {}
+        for field in cls.__dataclass_fields__.values():
+            camel_key = snake_to_camel(field.name)
+            snake_key = camel_to_snake(camel_key)
+            value = data.get(camel_key, data.get(snake_key))
+            if value is not None:
+                if isinstance(field.type, type) and issubclass(field.type, DynamicConversion):
+                    field_dict[field.name] = field.type.from_dict(value)
+                elif getattr(field.type, '__origin__', None) == List and issubclass(field.type.__args__[0], DynamicConversion):
+                    field_dict[field.name] = [field.type.__args__[0].from_dict(item) for item in value]
+                else:
+                    field_dict[field.name] = value
+            elif field.default is not field.default_factory:
+                field_dict[field.name] = field.default
+        return cls(**field_dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {}
+        for field in self.__dataclass_fields__.values():
+            value = getattr(self, field.name)
+            if isinstance(value, DynamicConversion):
+                result[snake_to_camel(field.name)] = value.to_dict()
+            elif isinstance(value, list) and value and isinstance(value[0], DynamicConversion):
+                result[snake_to_camel(field.name)] = [item.to_dict() for item in value]
+            elif value is not None:
+                result[snake_to_camel(field.name)] = value
+        return result
+
+@dataclass
+class SodaUser(DynamicConversion):
+    user_id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+
+@dataclass
+class SodaDatasetOwner(DynamicConversion):
+    type: Optional[str] = None
+    user: Optional[SodaUser] = None
+
+@dataclass
+class SodaDataConnection(DynamicConversion):
+    name: Optional[str] = None
+    type: Optional[str] = None
+    prefix: Optional[str] = None
+
+@dataclass
+class SodaDataset(DynamicConversion):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    label: Optional[str] = None
+    qualified_name: Optional[str] = None
+    last_updated: Optional[str] = None
+    datasource: Optional[SodaDataConnection] = None
+    data_quality_status: Optional[str] = None
+    health_status: Optional[int] = None
+    checks: Optional[int] = None
+    incidents: Optional[int] = None
+    cloud_url: Optional[str] = None
+    owners: List[SodaDatasetOwner] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.last_updated:
+            try:
+                self.last_updated = datetime.fromisoformat(self.last_updated.rstrip('Z'))
+            except ValueError:
+                logger.warning(f"Invalid datetime format for last_updated: {self.last_updated}")
+                self.last_updated = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = super().to_dict()
+        if isinstance(self.last_updated, datetime):
+            result['lastUpdated'] = self.last_updated.isoformat() + 'Z'
+        return result
+
+@dataclass
+class SodaApiResponse(DynamicConversion):
+    content: List[SodaDataset] = field(default_factory=list)
+    total_elements: Optional[int] = None
+    total_pages: Optional[int] = None
+    number: Optional[int] = None
+    size: Optional[int] = None
+    last: Optional[bool] = None
+    first: Optional[bool] = None
 
 @dataclass
 class SodaSourceReport(SourceReport):
@@ -53,6 +155,7 @@ class SodaSourceConfig(ConfigModel):
 
 
 class SodaApiClient:
+    limit = 1000
     def __init__(self, api_key: str, api_secret: str, host: str):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -81,13 +184,26 @@ class SodaApiClient:
             raise
 
     def get_checks(self):
-        return self._make_request("GET", "checks")
+        return self._make_request(method="GET", endpoint="checks")
 
-    def get_dataset_info(self, dataset_id: str):
-        return self._make_request("GET", f"datasets/{dataset_id}")
+    def get_datasets(self):
+        datasets = []
+        page = 0
+        while True:
+            try:
+                result = self._make_request(method="GET", endpoint="datasets", params={"limit": self.limit, "page": page})
+                api_response = SodaApiResponse.from_dict(result)
+                datasets.extend(api_response.content)
+                if api_response.last:
+                    break
+                page += 1
+            except Exception as e:
+                logger.error(f"Error fetching datasets page {page}: {e}")
+                break
+        return datasets
 
     def get_check_results(self, check_id: str, limit: int = 1):
-        return self._make_request("GET", f"checks/{check_id}/results", params={"limit": limit})
+        return self._make_request(method="GET", endpoint=f"checks/{check_id}/results", params={"limit": limit})
 
 
 class SodaSource(Source):
@@ -111,9 +227,13 @@ class SodaSource(Source):
         return cls(config, ctx)
 
     def get_workunits(self) -> Iterable[MetadataWorkUnit]:
+        datasets = self.soda_client.get_datasets()
+        for dataset in datasets:
+            logger.error(dataset)
         try:
             checks_response = self.soda_client.get_checks()
             checks = checks_response.get('content', [])
+
 
             for check in checks:
                 self.report.report_check_scanned()
@@ -123,6 +243,7 @@ class SodaSource(Source):
                 if not datasets:
                     logger.warning(f"No datasets found for check: {check.get('name', 'unknown')}")
                     continue
+
 
                 for dataset in datasets:
                     dataset_id = dataset.get('id')
