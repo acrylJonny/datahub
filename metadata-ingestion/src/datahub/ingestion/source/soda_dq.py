@@ -1,6 +1,7 @@
+import yaml
 import logging
-from typing import Iterable
-from dataclasses import field
+from typing import Iterable, Dict, Any, Optional, List, Union
+from dataclasses import field, dataclass
 from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
@@ -22,13 +23,6 @@ from datahub.metadata.schema_classes import (
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
 )
-
-logger = logging.getLogger(__name__)
-
-from dataclasses import dataclass, fields, MISSING
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +123,45 @@ class SodaApiResponse(DynamicConversion):
     first: Optional[bool] = None
 
 @dataclass
+class SodaCheck(DynamicConversion):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    evaluationStatus: Optional[str] = None
+    lastCheckRunTime: Optional[str] = None
+    definition: Optional[str] = None
+    datasets: List[SodaDataset] = field(default_factory=list)
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    owner: Optional[SodaUser] = None
+    agreements: List[Any] = field(default_factory=list)
+    incidents: List[Any] = field(default_factory=list)
+    cloudUrl: Optional[str] = None
+    lastUpdated: Optional[str] = None
+    group: Dict[str, Any] = field(default_factory=dict)
+    lastCheckResultValue: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.lastCheckRunTime:
+            try:
+                self.lastCheckRunTime = datetime.fromisoformat(self.lastCheckRunTime.rstrip('Z'))
+            except ValueError:
+                logger.warning(f"Invalid datetime format for lastCheckRunTime: {self.lastCheckRunTime}")
+                self.lastCheckRunTime = None
+        if self.lastUpdated:
+            try:
+                self.lastUpdated = datetime.fromisoformat(self.lastUpdated.rstrip('Z'))
+            except ValueError:
+                logger.warning(f"Invalid datetime format for lastUpdated: {self.lastUpdated}")
+                self.lastUpdated = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = super().to_dict()
+        if isinstance(self.lastCheckRunTime, datetime):
+            result['lastCheckRunTime'] = self.lastCheckRunTime.isoformat() + 'Z'
+        if isinstance(self.lastUpdated, datetime):
+            result['lastUpdated'] = self.lastUpdated.isoformat() + 'Z'
+        return result
+
+@dataclass
 class SodaSourceReport(SourceReport):
     checks_scanned: int = 0
     checks_failed: int = 0
@@ -155,8 +188,8 @@ class SodaSourceConfig(ConfigModel):
 
 
 class SodaApiClient:
-    limit = 1000
     def __init__(self, api_key: str, api_secret: str, host: str):
+        self.limit = 1000
         self.api_key = api_key
         self.api_secret = api_secret
         self.host = host
@@ -183,9 +216,6 @@ class SodaApiClient:
                 logger.error(f"Response content: {e.response.text}")
             raise
 
-    def get_checks(self):
-        return self._make_request(method="GET", endpoint="checks")
-
     def get_datasets(self):
         datasets = []
         page = 0
@@ -193,7 +223,7 @@ class SodaApiClient:
             try:
                 result = self._make_request(method="GET", endpoint="datasets", params={"limit": self.limit, "page": page})
                 api_response = SodaApiResponse.from_dict(result)
-                datasets.extend(api_response.content)
+                datasets.extend([SodaDataset.from_dict(dataset) if isinstance(dataset, dict) else dataset for dataset in api_response.content])
                 if api_response.last:
                     break
                 page += 1
@@ -202,8 +232,41 @@ class SodaApiClient:
                 break
         return datasets
 
-    def get_check_results(self, check_id: str, limit: int = 1):
-        return self._make_request(method="GET", endpoint=f"checks/{check_id}/results", params={"limit": limit})
+    def get_checks(self):
+        checks = []
+        page = 0
+        while True:
+            try:
+                result = self._make_request(method="GET", endpoint="checks", params={"limit": self.limit, "page": page})
+                api_response = SodaApiResponse.from_dict(result)
+                checks.extend([SodaCheck.from_dict(check) if isinstance(check, dict) else check for check in api_response.content])
+                if api_response.last:
+                    break
+                page += 1
+            except Exception as e:
+                logger.error(f"Error fetching checks page {page}: {e}")
+                break
+        return checks
+
+    def get_check_results(self, check_id: str = None, dataset_id: str = None):
+        url = f"https://reporting.{self.host}/v1/quality/check_results"
+        params = {
+            "size": self.limit
+        }
+        if check_id:
+            params["check_id"] = [check_id]
+        if dataset_id:
+            params["dataset_id"] = [dataset_id]
+
+        try:
+            response = requests.get(url, auth=self.auth, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching check results: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response content: {e.response.text}")
+            return None
 
 
 class SodaSource(Source):
@@ -227,129 +290,186 @@ class SodaSource(Source):
         return cls(config, ctx)
 
     def get_workunits(self) -> Iterable[MetadataWorkUnit]:
-        datasets = self.soda_client.get_datasets()
-        for dataset in datasets:
-            logger.error(dataset)
         try:
-            checks_response = self.soda_client.get_checks()
-            checks = checks_response.get('content', [])
+            datasets = self.soda_client.get_datasets()
+            checks = self.soda_client.get_checks()
 
+            dataset_lookup = {dataset.id: dataset for dataset in datasets if isinstance(dataset, SodaDataset)}
 
             for check in checks:
                 self.report.report_check_scanned()
-                datasets = check.get('datasets', [])
-                logger.error(datasets)
 
-                if not datasets:
-                    logger.warning(f"No datasets found for check: {check.get('name', 'unknown')}")
-                    continue
+                if isinstance(check, dict):
+                    check = SodaCheck.from_dict(check)
 
+                check_results = self.soda_client.get_check_results(check_id=check.id)
 
-                for dataset in datasets:
-                    dataset_id = dataset.get('id')
-                    if not dataset_id:
-                        logger.warning(f"No dataset ID found for check: {check.get('name', 'unknown')}")
+                for check_dataset in check.datasets:
+                    if isinstance(check_dataset, dict):
+                        check_dataset = SodaDataset.from_dict(check_dataset)
+
+                    full_dataset = dataset_lookup.get(check_dataset.id)
+                    if not full_dataset:
+                        logger.warning(
+                            f"No matching dataset found for check: {check.name} (Dataset ID: {check_dataset.id})")
                         continue
-
-                    dataset_info = self.soda_client.get_dataset_info(dataset_id)
-                    logger.error(dataset_info)
-                    dataset_name = dataset_info.get('name', 'unknown')
-                    database_name = dataset_info.get('databaseName', 'unknown')
-                    source_type = dataset_info.get('dataSourceType', 'unknown')
 
                     self.report.report_dataset_scanned()
 
                     dataset_urn = make_dataset_urn_with_platform_instance(
-                        self.config.platform,
-                        f"{database_name}.{dataset_name}".lower() if self.config.convert_column_urns_to_lowercase else f"{database_name}.{dataset_name}",
-                        self.config.platform_instance,
-                        self.config.environment
+                        platform=self.config.platform,
+                        name=full_dataset.qualified_name.lower() if self.config.convert_column_urns_to_lowercase else full_dataset.qualified_name,
+                        platform_instance=self.config.platform_instance,
+                        env=self.config.environment,
                     )
 
-                    assertion_urn = make_assertion_urn(f"{dataset_urn}:{check.get('name', 'unknown')}")
-                    yield from self._emit_assertion_wu(check, dataset_urn, assertion_urn, dataset_info)
+                    assertion_urn = make_assertion_urn(assertion_id=f"{dataset_urn}:{check.name}")
 
-                    # Use the last check result value if available
-                    last_check_result = check.get('lastCheckResultValue', {})
-                    if last_check_result:
-                        yield from self._emit_assertion_result_wu(check, last_check_result, dataset_urn, assertion_urn)
+                    yield from self._emit_assertion_wu(check=check, dataset_urn=dataset_urn,
+                                                       assertion_urn=assertion_urn, dataset=full_dataset)
+
+                    if check_results and check_results.get('content'):
+                        yield from self._emit_assertion_result_wu(result=check_results['content'][0],
+                                                                  dataset_urn=dataset_urn, assertion_urn=assertion_urn)
 
         except Exception as e:
             logger.error(f"Error fetching workunits: {e}")
+            logger.exception("Detailed traceback:")
 
-    def _emit_assertion_wu(self, check: Dict, dataset_urn: str, assertion_urn: str, dataset_info: Dict) -> Iterable[
-        MetadataWorkUnit]:
+    def _emit_assertion_wu(
+            self,
+            check: SodaCheck,
+            dataset_urn: str,
+            assertion_urn: str,
+            dataset: SodaDataset,
+    ) -> Iterable[MetadataWorkUnit]:
         try:
-            assertion_info = self._create_assertion_info(check, dataset_urn, dataset_info)
+            assertion_info = self._create_assertion_info(
+                check=check,
+                dataset_urn=dataset_urn,
+                dataset=dataset,
+            )
+
             mcp = MetadataChangeProposalWrapper(
                 entityType="assertion",
                 entityUrn=assertion_urn,
                 aspectName="assertionInfo",
                 aspect=assertion_info,
             )
-            wu = MetadataWorkUnit(id=f"{assertion_urn}-assertionInfo", mcp=mcp)
-            self.report.report_workunit(wu)
+
+            wu = MetadataWorkUnit(
+                id=f"{assertion_urn}-assertionInfo",
+                mcp=mcp,
+            )
+
+            self.report.report_workunit(wu=wu)
             yield wu
+
         except Exception as e:
             logger.error(f"Error emitting assertion workunit: {e}")
+            logger.exception("Detailed traceback:")
 
-    def _emit_assertion_result_wu(self, check: Dict, result: Dict, dataset_urn: str, assertion_urn: str) -> Iterable[
-        MetadataWorkUnit]:
+    def _create_assertion_info(
+        self,
+        check: SodaCheck,
+        dataset_urn: str,
+        dataset: SodaDataset,
+    ) -> AssertionInfoClass:
+        custom_properties = {
+            "soda_check_id": check.id,
+            "evaluation_status": check.evaluationStatus,
+            "last_check_run_time": check.lastCheckRunTime.isoformat()
+                if check.lastCheckRunTime
+                else "",
+        }
+
+        native_parameters = {
+            "definition": ""
+                #stringify_value(check.definition),
+        }
+
+        return AssertionInfoClass(
+            type=AssertionTypeClass.DATASET,
+            datasetAssertion=DatasetAssertionInfoClass(
+                dataset=dataset_urn,
+                scope=DatasetAssertionScopeClass.DATASET_COLUMN
+                if check.attributes.get('column')
+                else DatasetAssertionScopeClass.DATASET_ROWS,
+                operator="_NATIVE_",
+                aggregation="_NATIVE_",
+                fields=[
+                    make_schema_field_urn(
+                        parent_urn=dataset_urn,
+                        field_path=check.attributes.get('column'),
+                    )
+                ] if check.attributes.get('column')
+                else None,
+                nativeType=check.name,
+                nativeParameters=native_parameters,
+                logic=check.definition,
+            ),
+            customProperties=custom_properties,
+        )
+
+    def _emit_assertion_result_wu(
+            self,
+            result: Dict,
+            dataset_urn: str,
+            assertion_urn: str,
+    ) -> Iterable[MetadataWorkUnit]:
         try:
-            assertion_result = self._create_assertion_result(result, assertion_urn, dataset_urn)
+            assertion_result = self._create_assertion_result(
+                result=result,
+                assertion_urn=assertion_urn,
+                dataset_urn=dataset_urn,
+            )
+
             mcp = MetadataChangeProposalWrapper(
                 entityType="assertion",
                 entityUrn=assertion_urn,
                 aspectName="assertionRunEvent",
                 aspect=assertion_result,
             )
-            wu = MetadataWorkUnit(id=f"{assertion_urn}-assertionRunEvent", mcp=mcp)
+
+            wu = MetadataWorkUnit(
+                id=f"{assertion_urn}-assertionRunEvent",
+                mcp=mcp,
+            )
+
             self.report.report_workunit(wu)
             yield wu
+
         except Exception as e:
             logger.error(f"Error emitting assertion result workunit: {e}")
-
-    def _create_assertion_info(self, check: Dict, dataset_urn: str, dataset_info: Dict) -> AssertionInfoClass:
-        return AssertionInfoClass(
-            type=AssertionTypeClass.DATASET,
-            datasetAssertion=DatasetAssertionInfoClass(
-                dataset=dataset_urn,
-                scope=DatasetAssertionScopeClass.DATASET_COLUMN if check.get(
-                    'column') else DatasetAssertionScopeClass.DATASET,
-                operator=AssertionTypeClass.CUSTOM,
-                aggregation=None,
-                fields=[make_schema_field_urn(dataset_urn, check['column'])] if check.get('column') else [],
-                nativeType=check.get('name', 'unknown'),
-                nativeParameters={"definition": check.get('definition', '')},
-            ),
-            customProperties={
-                "soda_check_id": check['id'],
-                "evaluation_status": check.get('evaluationStatus', 'unknown'),
-                "last_check_run_time": check.get('lastCheckRunTime', ''),
-                "database_name": dataset_info.get('databaseName', 'unknown'),
-                "dataset_name": dataset_info.get('name', 'unknown'),
-                "source_type": dataset_info.get('dataSourceType', 'unknown'),
-            },
-        )
+            logger.exception("Detailed traceback:")
 
     def _create_assertion_result(self, result: Dict, assertion_urn: str, dataset_urn: str) -> AssertionRunEventClass:
-        if 'valueSeries' in result:
-            # For schema checks
-            outcome = next((item['label'] for item in result['valueSeries']['values'] if item['value'] > 0), 'unknown')
-            native_results = result['valueSeries']
-        else:
-            # For other checks
-            outcome = 'fail' if result.get('value', 0) > 0 else 'pass'
-            native_results = result
+        def flatten_dict(obj: Any, prefix: str = '') -> Dict[str, str]:
+            flattened = {}
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    new_key = f"{prefix}.{k}" if prefix else k
+                    flattened.update(flatten_dict(v, new_key))
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    new_key = f"{prefix}[{i}]"
+                    flattened.update(flatten_dict(item, new_key))
+            else:
+                flattened[prefix] = str(obj)
+            return flattened
+
+        flattened_result = flatten_dict(result)
+
+        outcome = result.get('outcome', 'unknown')
 
         return AssertionRunEventClass(
-            timestampMillis=int(datetime.now().timestamp() * 1000),
+            timestampMillis=int(datetime.fromisoformat(result.get('timeWindowStart', datetime.now().isoformat())).timestamp() * 1000),
             assertionUrn=assertion_urn,
             asserteeUrn=dataset_urn,
-            runId='latest',
+            runId=result.get('id', 'latest'),
             result=AssertionResultClass(
                 type=AssertionResultTypeClass.SUCCESS if outcome == 'pass' else AssertionResultTypeClass.FAILURE,
-                nativeResults=native_results,
+                nativeResults=flattened_result,
             ),
             status=AssertionRunStatusClass.COMPLETE,
         )
