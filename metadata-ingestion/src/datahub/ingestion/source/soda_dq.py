@@ -1,6 +1,5 @@
-import yaml
 import logging
-from typing import Iterable, Dict, Any, Optional, List, Union
+from typing import Iterable, Dict, Any, Optional, List
 from dataclasses import field, dataclass
 from datetime import datetime
 import requests
@@ -162,6 +161,64 @@ class SodaCheck(DynamicConversion):
         return result
 
 @dataclass
+class SodaCheckResultOwner(DynamicConversion):
+    id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    job_title: Optional[str] = None
+    phone_number: Optional[str] = None
+    user_type: Optional[str] = None
+
+@dataclass
+class SodaCheckResult(DynamicConversion):
+    result_id: Optional[str] = None
+    scan_time: Optional[str] = None
+    level: Optional[str] = None
+    check_id: Optional[str] = None
+    check_name: Optional[str] = None
+    created_at: Optional[str] = None
+    dataset_id: Optional[str] = None
+    organization_id: Optional[str] = None
+    metric_value: Optional[float] = None
+    owner: Optional[SodaCheckResultOwner] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.scan_time:
+            try:
+                self.scan_time = datetime.fromisoformat(self.scan_time.rstrip('Z'))
+            except ValueError:
+                logger.warning(f"Invalid datetime format for scan_time: {self.scan_time}")
+                self.scan_time = None
+        if self.created_at:
+            try:
+                self.created_at = datetime.fromisoformat(self.created_at.rstrip('Z'))
+            except ValueError:
+                logger.warning(f"Invalid datetime format for created_at: {self.created_at}")
+                self.created_at = None
+        if isinstance(self.owner, dict):
+            self.owner = SodaCheckResultOwner.from_dict(self.owner)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = super().to_dict()
+        if isinstance(self.scan_time, datetime):
+            result['scanTime'] = self.scan_time.isoformat() + 'Z'
+        if isinstance(self.created_at, datetime):
+            result['createdAt'] = self.created_at.isoformat() + 'Z'
+        return result
+
+@dataclass
+class SodaCheckResultsResponse(DynamicConversion):
+    total: Optional[int] = None
+    page: Optional[int] = None
+    size: Optional[int] = None
+    data: List[SodaCheckResult] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.data = [SodaCheckResult.from_dict(item) if isinstance(item, dict) else item for item in self.data]
+
+@dataclass
 class SodaSourceReport(SourceReport):
     checks_scanned: int = 0
     checks_failed: int = 0
@@ -187,76 +244,71 @@ class SodaSourceConfig(ConfigModel):
     environment: str = "PROD"
 
 
-import base64
-
-import requests
-from requests.auth import HTTPBasicAuth
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 class SodaApiClient:
-    def __init__(self, api_key: str, api_secret: str, host: str):
+    def __init__(self, api_key_id: str, api_key_secret: str, host: str):
         self.limit = 1000
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key_id = api_key_id
+        self.api_key_secret = api_key_secret
         self.host = host
-        self.auth = HTTPBasicAuth(self.api_key, self.api_secret)
+        self.auth = HTTPBasicAuth(
+            username=self.api_key_id,
+            password=self.api_key_secret,
+        )
         self.headers = {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        self.token = None
+        self.reporting_headers = {
+            "Content-Type": "application/json",
+            "X-API-KEY-ID": self.api_key_id,
+            "X-API-KEY-SECRET": self.api_key_secret,
+        }
 
-    def _make_request(self, method: str, url: str, params: dict = None, json: dict = None):
+    def _make_request(
+            self,
+            method: str,
+            url: str,
+            params: Optional[Dict[str, Any]] = None,
+            json: Optional[Dict[str, Any]] = None,
+    ):
         try:
             response = requests.request(
-                method,
-                url,
+                method=method,
+                url=url,
                 auth=self.auth,
                 headers=self.headers,
                 params=params,
-                json=json
+                json=json,
             )
             response.raise_for_status()
             return response.json()
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Error making request to {url}: {e}")
+
             if hasattr(e.response, 'text'):
                 logger.error(f"Response content: {e.response.text}")
             raise
 
-    def _get_token(self):
-        if self.token is None:
-            url = f"https://reporting.{self.host}/v1/get_token"
-            try:
-                response = requests.post(url, auth=self.auth)
-                response.raise_for_status()
-                self.token = response.json().get('token')
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error getting token: {e}")
-                if hasattr(e.response, 'text'):
-                    logger.error(f"Response content: {e.response.text}")
-                raise
-        return self.token
-
-    def _make_reporting_request(self, method: str, url: str, json: dict = None):
-        token = self._get_token()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
+    def _make_reporting_request(
+            self,
+            method: str,
+            url: str,
+            json: Optional[Dict[str, Any]] = None,
+    ):
         try:
             response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=json
+                method=method,
+                url=url,
+                headers=self.reporting_headers,
+                json=json,
             )
+
             response.raise_for_status()
             return response.json()
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error making request to {url}: {e}")
+            logger.error(f"Error making reporting request to {url}: {e}")
+
             if hasattr(e.response, 'text'):
                 logger.error(f"Response content: {e.response.text}")
             raise
@@ -264,61 +316,109 @@ class SodaApiClient:
     def get_datasets(self):
         datasets = []
         page = 0
+
         while True:
             try:
                 url = f"https://{self.host}/api/v1/datasets"
-                result = self._make_request(method="GET", url=url, params={"limit": self.limit, "page": page})
+                result = self._make_request(
+                    method="GET",
+                    url=url,
+                    params={
+                        "limit": self.limit,
+                        "page": page
+                    },
+                )
+
                 api_response = SodaApiResponse.from_dict(result)
-                datasets.extend([SodaDataset.from_dict(dataset) if isinstance(dataset, dict) else dataset for dataset in
-                                 api_response.content])
+
+                datasets.extend(
+                    [
+                        SodaDataset.from_dict(dataset)
+                        if isinstance(dataset, dict)
+                        else dataset
+                        for dataset in api_response.content
+                    ]
+                )
+
                 if api_response.last:
                     break
                 page += 1
+
             except Exception as e:
                 logger.error(f"Error fetching datasets page {page}: {e}")
                 break
+
         return datasets
 
     def get_checks(self):
         checks = []
         page = 0
+
         while True:
             try:
                 url = f"https://{self.host}/api/v1/checks"
-                result = self._make_request(method="GET", url=url, params={"limit": self.limit, "page": page})
+                result = self._make_request(
+                    method="GET",
+                    url=url,
+                    params={
+                        "limit": self.limit,
+                        "page": page,
+                    },
+                )
+
                 api_response = SodaApiResponse.from_dict(result)
-                checks.extend([SodaCheck.from_dict(check) if isinstance(check, dict) else check for check in
-                               api_response.content])
+
+                checks.extend(
+                    [
+                        SodaCheck.from_dict(check)
+                        if isinstance(check, dict)
+                        else check
+                        for check in api_response.content
+                    ]
+                )
                 if api_response.last:
                     break
                 page += 1
+
             except Exception as e:
                 logger.error(f"Error fetching checks page {page}: {e}")
                 break
+
         return checks
 
-    def get_check_results(self, check_ids: List[str], dataset_ids: List[str], page: int = 1, size: int = 100):
+    def get_check_results(
+            self,
+            check_ids: List[str],
+            dataset_ids: List[str],
+            page: int = 1,
+    ) -> SodaCheckResultsResponse:
         url = f"https://reporting.{self.host}/v1/quality/check_results"
 
         body = {
             "checkIds": check_ids,
             "datasetIds": dataset_ids,
             "page": page,
-            "size": size
+            "size": self.limit
         }
 
         try:
             result = self._make_reporting_request(
                 method="POST",
                 url=url,
-                json=body
+                json=body,
             )
-            return result
+            return SodaCheckResultsResponse.from_dict(result)
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching check results: {e}")
             if hasattr(e.response, 'text'):
                 logger.error(f"Response content: {e.response.text}")
-            return None
+
+            return SodaCheckResultsResponse(
+                total=0,
+                page=page,
+                size=self.limit,
+            )
 
 
 class SodaSource(Source):
@@ -331,8 +431,8 @@ class SodaSource(Source):
         self.config = config
         self.report = SodaSourceReport()
         self.soda_client = SodaApiClient(
-            api_key=config.api_key,
-            api_secret=config.api_secret,
+            api_key_id=config.api_key,
+            api_key_secret=config.api_secret,
             host=config.host
         )
 
@@ -346,7 +446,11 @@ class SodaSource(Source):
             datasets = self.soda_client.get_datasets()
             checks = self.soda_client.get_checks()
 
-            dataset_lookup = {dataset.id: dataset for dataset in datasets if isinstance(dataset, SodaDataset)}
+            dataset_lookup = {
+                dataset.id: dataset
+                for dataset in datasets
+                if isinstance(dataset, SodaDataset)
+            }
 
             for check in checks:
                 self.report.report_check_scanned()
@@ -354,14 +458,33 @@ class SodaSource(Source):
                 if isinstance(check, dict):
                     check = SodaCheck.from_dict(check)
 
+                # Ensure all datasets in check.datasets are SodaDataset objects
+                check_datasets = [
+                    SodaDataset.from_dict(dataset)
+                    if isinstance(dataset, dict)
+                    else dataset
+                    for dataset in check.datasets
+                ]
+
                 check_results = self.soda_client.get_check_results(
                     check_ids=[check.id],
-                    dataset_ids=[ds.get("id") for ds in check.datasets]
+                    dataset_ids=[
+                        dataset.id
+                        for dataset in check_datasets
+                        if dataset.id
+                    ],
                 )
 
-                for check_dataset in check.datasets:
-                    if isinstance(check_dataset, dict):
-                        check_dataset = SodaDataset.from_dict(check_dataset)
+                # Create a lookup for check results by dataset_id
+                check_results_lookup = {
+                    result.dataset_id: result
+                    for result in check_results.data
+                }
+
+                for check_dataset in check_datasets:
+                    if not check_dataset.id:
+                        logger.warning(f"Dataset in check {check.name} has no ID. Skipping.")
+                        continue
 
                     full_dataset = dataset_lookup.get(check_dataset.id)
                     if not full_dataset:
@@ -373,19 +496,31 @@ class SodaSource(Source):
 
                     dataset_urn = make_dataset_urn_with_platform_instance(
                         platform=self.config.platform,
-                        name=full_dataset.qualified_name.lower() if self.config.convert_column_urns_to_lowercase else full_dataset.qualified_name,
+                        name=full_dataset.qualified_name.lower()
+                        if self.config.convert_column_urns_to_lowercase
+                        else full_dataset.qualified_name,
                         platform_instance=self.config.platform_instance,
                         env=self.config.environment,
                     )
 
-                    assertion_urn = make_assertion_urn(assertion_id=f"{dataset_urn}:{check.name}")
+                    assertion_urn = make_assertion_urn(
+                        assertion_id=f"{dataset_urn}:{check.name}",
+                    )
 
-                    yield from self._emit_assertion_wu(check=check, dataset_urn=dataset_urn,
-                                                       assertion_urn=assertion_urn, dataset=full_dataset)
+                    yield from self._emit_assertion_wu(
+                        check=check,
+                        dataset_urn=dataset_urn,
+                        assertion_urn=assertion_urn,
+                        dataset=full_dataset,
+                    )
 
-                    if check_results and check_results.get('content'):
-                        yield from self._emit_assertion_result_wu(result=check_results['content'][0],
-                                                                  dataset_urn=dataset_urn, assertion_urn=assertion_urn)
+                    check_result = check_results_lookup.get(check_dataset.id)
+                    if check_result:
+                        yield from self._emit_assertion_result_wu(
+                            result=check_result,
+                            dataset_urn=dataset_urn,
+                            assertion_urn=assertion_urn,
+                        )
 
         except Exception as e:
             logger.error(f"Error fetching workunits: {e}")
@@ -439,8 +574,7 @@ class SodaSource(Source):
         }
 
         native_parameters = {
-            "definition": ""
-                #stringify_value(check.definition),
+            "definition": check.definition or "",
         }
 
         return AssertionInfoClass(
@@ -468,7 +602,7 @@ class SodaSource(Source):
 
     def _emit_assertion_result_wu(
             self,
-            result: Dict,
+            result: SodaCheckResult,
             dataset_urn: str,
             assertion_urn: str,
     ) -> Iterable[MetadataWorkUnit]:
@@ -498,33 +632,46 @@ class SodaSource(Source):
             logger.error(f"Error emitting assertion result workunit: {e}")
             logger.exception("Detailed traceback:")
 
-    def _create_assertion_result(self, result: Dict, assertion_urn: str, dataset_urn: str) -> AssertionRunEventClass:
-        def flatten_dict(obj: Any, prefix: str = '') -> Dict[str, str]:
-            flattened = {}
+    def _create_assertion_result(
+            self,
+            result: SodaCheckResult,
+            assertion_urn: str,
+            dataset_urn: str,
+    ) -> AssertionRunEventClass:
+
+        def stringify_dict(obj: Any) -> Dict[str, str]:
             if isinstance(obj, dict):
-                for k, v in obj.items():
-                    new_key = f"{prefix}.{k}" if prefix else k
-                    flattened.update(flatten_dict(v, new_key))
+                return {
+                    str(k): stringify_dict(v)
+                    for k, v in obj.items()
+                }
             elif isinstance(obj, list):
-                for i, item in enumerate(obj):
-                    new_key = f"{prefix}[{i}]"
-                    flattened.update(flatten_dict(item, new_key))
+                return {
+                    str(i): stringify_dict(v)
+                    for i, v in enumerate(obj)
+                }
+            elif isinstance(obj, (int, float, bool)):
+                return str(obj)
+            elif obj is None:
+                return "None"
             else:
-                flattened[prefix] = str(obj)
-            return flattened
+                return str(obj)
 
-        flattened_result = flatten_dict(result)
-
-        outcome = result.get('outcome', 'unknown')
+        native_results = stringify_dict(result.to_dict())
 
         return AssertionRunEventClass(
-            timestampMillis=int(datetime.fromisoformat(result.get('timeWindowStart', datetime.now().isoformat())).timestamp() * 1000),
+            timestampMillis=int(
+                result.scan_time.timestamp() * 1000
+            ) if result.scan_time
+            else int(datetime.now().timestamp() * 1000),
             assertionUrn=assertion_urn,
             asserteeUrn=dataset_urn,
-            runId=result.get('id', 'latest'),
+            runId=result.result_id,
             result=AssertionResultClass(
-                type=AssertionResultTypeClass.SUCCESS if outcome == 'pass' else AssertionResultTypeClass.FAILURE,
-                nativeResults=flattened_result,
+                type=AssertionResultTypeClass.SUCCESS
+                if result.level == 'pass'
+                else AssertionResultTypeClass.FAILURE,
+                nativeResults=native_results,
             ),
             status=AssertionRunStatusClass.COMPLETE,
         )
