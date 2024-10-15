@@ -187,6 +187,15 @@ class SodaSourceConfig(ConfigModel):
     environment: str = "PROD"
 
 
+import base64
+
+import requests
+from requests.auth import HTTPBasicAuth
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 class SodaApiClient:
     def __init__(self, api_key: str, api_secret: str, host: str):
         self.limit = 1000
@@ -197,16 +206,52 @@ class SodaApiClient:
         self.headers = {
             "Content-Type": "application/json"
         }
+        self.token = None
 
-    def _make_request(self, method: str, endpoint: str, params: dict = None):
-        url = f"https://{self.host}/api/v1/{endpoint}"
+    def _make_request(self, method: str, url: str, params: dict = None, json: dict = None):
         try:
             response = requests.request(
                 method,
                 url,
                 auth=self.auth,
                 headers=self.headers,
-                params=params
+                params=params,
+                json=json
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error making request to {url}: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response content: {e.response.text}")
+            raise
+
+    def _get_token(self):
+        if self.token is None:
+            url = f"https://reporting.{self.host}/v1/get_token"
+            try:
+                response = requests.post(url, auth=self.auth)
+                response.raise_for_status()
+                self.token = response.json().get('token')
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error getting token: {e}")
+                if hasattr(e.response, 'text'):
+                    logger.error(f"Response content: {e.response.text}")
+                raise
+        return self.token
+
+    def _make_reporting_request(self, method: str, url: str, json: dict = None):
+        token = self._get_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json
             )
             response.raise_for_status()
             return response.json()
@@ -221,9 +266,11 @@ class SodaApiClient:
         page = 0
         while True:
             try:
-                result = self._make_request(method="GET", endpoint="datasets", params={"limit": self.limit, "page": page})
+                url = f"https://{self.host}/api/v1/datasets"
+                result = self._make_request(method="GET", url=url, params={"limit": self.limit, "page": page})
                 api_response = SodaApiResponse.from_dict(result)
-                datasets.extend([SodaDataset.from_dict(dataset) if isinstance(dataset, dict) else dataset for dataset in api_response.content])
+                datasets.extend([SodaDataset.from_dict(dataset) if isinstance(dataset, dict) else dataset for dataset in
+                                 api_response.content])
                 if api_response.last:
                     break
                 page += 1
@@ -237,9 +284,11 @@ class SodaApiClient:
         page = 0
         while True:
             try:
-                result = self._make_request(method="GET", endpoint="checks", params={"limit": self.limit, "page": page})
+                url = f"https://{self.host}/api/v1/checks"
+                result = self._make_request(method="GET", url=url, params={"limit": self.limit, "page": page})
                 api_response = SodaApiResponse.from_dict(result)
-                checks.extend([SodaCheck.from_dict(check) if isinstance(check, dict) else check for check in api_response.content])
+                checks.extend([SodaCheck.from_dict(check) if isinstance(check, dict) else check for check in
+                               api_response.content])
                 if api_response.last:
                     break
                 page += 1
@@ -248,20 +297,23 @@ class SodaApiClient:
                 break
         return checks
 
-    def get_check_results(self, check_id: str = None, dataset_id: str = None):
+    def get_check_results(self, check_ids: List[str], dataset_ids: List[str], page: int = 1, size: int = 100):
         url = f"https://reporting.{self.host}/v1/quality/check_results"
-        params = {
-            "size": self.limit
+
+        body = {
+            "checkIds": check_ids,
+            "datasetIds": dataset_ids,
+            "page": page,
+            "size": size
         }
-        if check_id:
-            params["check_id"] = [check_id]
-        if dataset_id:
-            params["dataset_id"] = [dataset_id]
 
         try:
-            response = requests.get(url, auth=self.auth, params=params)
-            response.raise_for_status()
-            return response.json()
+            result = self._make_reporting_request(
+                method="POST",
+                url=url,
+                json=body
+            )
+            return result
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching check results: {e}")
             if hasattr(e.response, 'text'):
@@ -302,7 +354,10 @@ class SodaSource(Source):
                 if isinstance(check, dict):
                     check = SodaCheck.from_dict(check)
 
-                check_results = self.soda_client.get_check_results(check_id=check.id)
+                check_results = self.soda_client.get_check_results(
+                    check_ids=[check.id],
+                    dataset_ids=[ds.get("id") for ds in check.datasets]
+                )
 
                 for check_dataset in check.datasets:
                     if isinstance(check_dataset, dict):
