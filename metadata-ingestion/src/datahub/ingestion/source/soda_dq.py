@@ -13,7 +13,7 @@ from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.emitter.mce_builder import (
     make_assertion_urn,
     make_dataset_urn_with_platform_instance,
-    make_schema_field_urn,
+    make_schema_field_urn, make_data_platform_urn,
 )
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.metadata.schema_classes import (
@@ -25,9 +25,11 @@ from datahub.metadata.schema_classes import (
     AssertionTypeClass,
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
+    DataPlatformInstanceClass,
     FabricTypeClass,
     PartitionSpecClass,
     PartitionTypeClass,
+    StatusClass,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,25 @@ class DynamicConversion:
             elif value is not None:
                 result[snake_to_camel(fld.name)] = value
         return result
+
+SODA_TO_DATAHUB_PLATFORM_MAP = {
+    "redshift": "redshift",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "postgresql": "postgres",
+    "sqlserver": "mssql",
+    "mysql": "mysql",
+    "oracle": "oracle",
+    "athena": "athena",
+    "synapse": "synapse",
+    "databricks": "databricks",
+    "trino": "trino",
+    "presto": "presto",
+    "spark": "spark",
+    "dremio": "dremio",
+    "vertica": "vertica",
+    "db2": "db2",
+}
 
 
 @dataclass
@@ -498,6 +519,9 @@ class SodaSource(Source):
         config = SodaSourceConfig.parse_obj(config_dict)
         return cls(config, ctx)
 
+    def get_platform(self):
+        return "soda"
+
     def get_platform_info(self, dataset: SodaDataset) -> Dict[str, str]:
         if dataset.datasource:
             datasource_name = dataset.datasource[
@@ -510,14 +534,16 @@ class SodaSource(Source):
             source_info = self.config.source_mapping.get(datasource_name)
             if source_info:
                 return {
-                    "platform": datasource_type,
+                    "platform": SODA_TO_DATAHUB_PLATFORM_MAP.get(datasource_type.lower()),
                     "platform_instance": source_info.platform_instance or None,
                     "env": source_info.env or self.config.env,
                 }
 
         # If no mapping is present or datasource is None, use default values
         return {
-            "platform": dataset.datasource['type'] if isinstance(
+            "platform": SODA_TO_DATAHUB_PLATFORM_MAP.get(
+                dataset.datasource['type'].lower(),
+            ) if isinstance(
                 dataset.datasource,
                 dict,
             ) and 'type' in dataset.datasource
@@ -600,6 +626,14 @@ class SodaSource(Source):
                         assertion_urn=assertion_urn,
                     )
 
+                    yield from self._emit_platform_wu(
+                        assertion_urn=assertion_urn
+                    )
+
+                    yield from self._emit_status_wu(
+                        assertion_urn=assertion_urn
+                    )
+
                     check_result = check_results_lookup.get(check_dataset.id)
                     if check_result:
                         yield from self._emit_assertion_result_wu(
@@ -633,6 +667,60 @@ class SodaSource(Source):
 
             wu = MetadataWorkUnit(
                 id=f"{assertion_urn}-assertionInfo",
+                mcp=mcp,
+            )
+
+            self.report.report_workunit(wu=wu)
+            yield wu
+
+        except Exception as e:
+            logger.error(f"Error emitting assertion workunit: {e}")
+            logger.exception("Detailed traceback:")
+
+    def _emit_platform_wu(
+            self,
+            assertion_urn: str,
+    ) -> Iterable[MetadataWorkUnit]:
+        try:
+            mcp = MetadataChangeProposalWrapper(
+                entityType="assertion",
+                entityUrn=assertion_urn,
+                aspectName="dataPlatformInstance",
+                aspect=DataPlatformInstanceClass(
+                    platform=make_data_platform_urn(
+                        self.get_platform(),
+                    )
+                ),
+            )
+
+            wu = MetadataWorkUnit(
+                id=f"{assertion_urn}-dataPlatformInstance",
+                mcp=mcp,
+            )
+
+            self.report.report_workunit(wu=wu)
+            yield wu
+
+        except Exception as e:
+            logger.error(f"Error emitting assertion workunit: {e}")
+            logger.exception("Detailed traceback:")
+
+    def _emit_status_wu(
+            self,
+            assertion_urn: str,
+    ) -> Iterable[MetadataWorkUnit]:
+        try:
+            mcp = MetadataChangeProposalWrapper(
+                entityType="assertion",
+                entityUrn=assertion_urn,
+                aspectName="status",
+                aspect=StatusClass(
+                    removed=False,
+                    ),
+                )
+
+            wu = MetadataWorkUnit(
+                id=f"{assertion_urn}-status",
                 mcp=mcp,
             )
 
