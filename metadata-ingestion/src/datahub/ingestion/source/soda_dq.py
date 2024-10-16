@@ -1,8 +1,7 @@
-import json
 import logging
 from typing import Iterable, Dict, Any, Optional, List
 from dataclasses import field, dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import requests
 from requests.auth import HTTPBasicAuth
 from pydantic import Field, BaseModel
@@ -17,7 +16,6 @@ from datahub.emitter.mce_builder import (
     make_schema_field_urn,
 )
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
-from datahub.metadata._schema_classes import PartitionSpecClass, PartitionTypeClass
 from datahub.metadata.schema_classes import (
     AssertionInfoClass,
     AssertionResultClass,
@@ -28,6 +26,8 @@ from datahub.metadata.schema_classes import (
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
     FabricTypeClass,
+    PartitionSpecClass,
+    PartitionTypeClass,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,36 +39,38 @@ def snake_to_camel(string: str) -> str:
 def camel_to_snake(string: str) -> str:
     return ''.join(['_' + char.lower() if char.isupper() else char for char in string]).lstrip('_')
 
+
 class DynamicConversion:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Any:
         field_dict = {}
-        for field in cls.__dataclass_fields__.values():
-            camel_key = snake_to_camel(field.name)
+        for fld in cls.__dataclass_fields__.values():
+            camel_key = snake_to_camel(fld.name)
             snake_key = camel_to_snake(camel_key)
             value = data.get(camel_key, data.get(snake_key))
             if value is not None:
-                if isinstance(field.type, type) and issubclass(field.type, DynamicConversion):
-                    field_dict[field.name] = field.type.from_dict(value)
-                elif getattr(field.type, '__origin__', None) == List and issubclass(field.type.__args__[0], DynamicConversion):
-                    field_dict[field.name] = [field.type.__args__[0].from_dict(item) for item in value]
+                if isinstance(fld.type, type) and issubclass(fld.type, DynamicConversion):
+                    field_dict[fld.name] = fld.type.from_dict(value)
+                elif getattr(fld.type, '__origin__', None) == List and issubclass(fld.type.__args__[0], DynamicConversion):
+                    field_dict[fld.name] = [fld.type.__args__[0].from_dict(item) for item in value]
                 else:
-                    field_dict[field.name] = value
-            elif field.default is not field.default_factory:
-                field_dict[field.name] = field.default
+                    field_dict[fld.name] = value
+            elif fld.default is not fld.default_factory:
+                field_dict[fld.name] = fld.default
         return cls(**field_dict)
 
     def to_dict(self) -> Dict[str, Any]:
         result = {}
-        for field in self.__dataclass_fields__.values():
-            value = getattr(self, field.name)
+        for fld in self.__dataclass_fields__.values():
+            value = getattr(self, fld.name)
             if isinstance(value, DynamicConversion):
-                result[snake_to_camel(field.name)] = value.to_dict()
+                result[snake_to_camel(fld.name)] = value.to_dict()
             elif isinstance(value, list) and value and isinstance(value[0], DynamicConversion):
-                result[snake_to_camel(field.name)] = [item.to_dict() for item in value]
+                result[snake_to_camel(fld.name)] = [item.to_dict() for item in value]
             elif value is not None:
-                result[snake_to_camel(field.name)] = value
+                result[snake_to_camel(fld.name)] = value
         return result
+
 
 @dataclass
 class SodaUser(DynamicConversion):
@@ -78,16 +80,19 @@ class SodaUser(DynamicConversion):
     full_name: Optional[str] = None
     email: Optional[str] = None
 
+
 @dataclass
 class SodaDatasetOwner(DynamicConversion):
     type: Optional[str] = None
     user: Optional[SodaUser] = None
+
 
 @dataclass
 class SodaDataConnection(DynamicConversion):
     name: Optional[str] = None
     type: Optional[str] = None
     prefix: Optional[str] = None
+
 
 @dataclass
 class SodaDataset(DynamicConversion):
@@ -118,6 +123,7 @@ class SodaDataset(DynamicConversion):
             result['lastUpdated'] = self.last_updated.isoformat() + 'Z'
         return result
 
+
 @dataclass
 class SodaApiResponse(DynamicConversion):
     content: List[SodaDataset] = field(default_factory=list)
@@ -127,6 +133,7 @@ class SodaApiResponse(DynamicConversion):
     size: Optional[int] = None
     last: Optional[bool] = None
     first: Optional[bool] = None
+
 
 @dataclass
 class SodaCheck(DynamicConversion):
@@ -167,6 +174,7 @@ class SodaCheck(DynamicConversion):
             result['lastUpdated'] = self.lastUpdated.isoformat() + 'Z'
         return result
 
+
 @dataclass
 class SodaCheckResultOwner(DynamicConversion):
     id: Optional[str] = None
@@ -176,6 +184,7 @@ class SodaCheckResultOwner(DynamicConversion):
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     user_type: Optional[str] = None
+
 
 @dataclass
 class SodaCheckResult(DynamicConversion):
@@ -215,6 +224,7 @@ class SodaCheckResult(DynamicConversion):
             result['createdAt'] = self.created_at.isoformat() + 'Z'
         return result
 
+
 @dataclass
 class SodaCheckResultsResponse(DynamicConversion):
     total: Optional[int] = None
@@ -224,6 +234,7 @@ class SodaCheckResultsResponse(DynamicConversion):
 
     def __post_init__(self):
         self.data = [SodaCheckResult.from_dict(item) if isinstance(item, dict) else item for item in self.data]
+
 
 @dataclass
 class SodaSourceReport(SourceReport):
@@ -239,6 +250,7 @@ class SodaSourceReport(SourceReport):
 
     def report_dataset_scanned(self) -> None:
         self.datasets_scanned += 1
+
 
 class SourceMappingConfig(BaseModel):
     platform_instance: Optional[str] = Field(
@@ -554,13 +566,16 @@ class SodaSource(Source):
 
                 for check_dataset in check_datasets:
                     if not check_dataset.id:
-                        logger.warning(f"Dataset in check {check.name} has no ID. Skipping.")
+                        logger.warning(
+                            f"Dataset in check {check.name} has no ID. Skipping.",
+                       )
                         continue
 
                     full_dataset = dataset_lookup.get(check_dataset.id)
                     if not full_dataset:
                         logger.warning(
-                            f"No matching dataset found for check: {check.name} (Dataset ID: {check_dataset.id})")
+                            f"No matching dataset found for check: {check.name} (Dataset ID: {check_dataset.id})"
+                        )
                         continue
 
                     self.report.report_dataset_scanned()
