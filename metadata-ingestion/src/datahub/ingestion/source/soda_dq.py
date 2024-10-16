@@ -1,17 +1,23 @@
+import json
 import logging
 from typing import Iterable, Dict, Any, Optional, List
 from dataclasses import field, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 from requests.auth import HTTPBasicAuth
+from pydantic import Field, BaseModel
 
 from datahub.configuration.common import ConfigModel
 from datahub.ingestion.api.common import PipelineContext
 from datahub.ingestion.api.source import Source, SourceReport
 from datahub.ingestion.api.workunit import MetadataWorkUnit
-from datahub.emitter.mce_builder import make_dataset_urn_with_platform_instance, make_assertion_urn, \
-    make_schema_field_urn
+from datahub.emitter.mce_builder import (
+    make_assertion_urn,
+    make_dataset_urn_with_platform_instance,
+    make_schema_field_urn,
+)
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.metadata._schema_classes import PartitionSpecClass, PartitionTypeClass
 from datahub.metadata.schema_classes import (
     AssertionInfoClass,
     AssertionResultClass,
@@ -21,6 +27,7 @@ from datahub.metadata.schema_classes import (
     AssertionTypeClass,
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
+    FabricTypeClass,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,15 +240,53 @@ class SodaSourceReport(SourceReport):
     def report_dataset_scanned(self) -> None:
         self.datasets_scanned += 1
 
+class SourceMappingConfig(BaseModel):
+    platform_instance: Optional[str] = Field(
+        default="",
+        description="Platform instance for the upstream source in DataHub.",
+    )
+    env: Optional[str] = Field(
+        default=FabricTypeClass.PROD,
+        description="Platform instance for the upstream source in DataHub.",
+    )
+
 
 class SodaSourceConfig(ConfigModel):
-    api_key: str
-    api_secret: str
-    host: str = "cloud.soda.io"
-    platform: str
-    platform_instance: Optional[str] = None
-    convert_column_urns_to_lowercase: bool = False
-    environment: str = "PROD"
+
+    api_key_id: Optional[str] = Field(
+        default=None,
+        description="Soda API Key",
+    )
+
+    api_secret_key_id: Optional[str] = Field(
+        default=None,
+        description="Soda API Secret Key ID",
+    )
+
+    hostname: Optional[str] = Field(
+        default="cloud.soda.io",
+        description="Hostname or IP Address of the Dremio server",
+    )
+
+    platform_instance: Optional[str] = Field(
+        default="",
+        description="Platform instance for the source.",
+    )
+
+    env: str = Field(
+        default=FabricTypeClass.PROD,
+        description="Environment to use in namespace when constructing URNs.",
+    )
+
+    source_mapping: Dict[str, SourceMappingConfig] = Field(
+        default_factory=dict,
+        description="Mapping of Soda datasource names to their corresponding platform_instance and env.",
+    )
+
+    convert_urns_to_lowercase: Optional[bool] = Field(
+        default=True,
+        description="Platform instance for the source.",
+    )
 
 
 class SodaApiClient:
@@ -431,15 +476,43 @@ class SodaSource(Source):
         self.config = config
         self.report = SodaSourceReport()
         self.soda_client = SodaApiClient(
-            api_key_id=config.api_key,
-            api_key_secret=config.api_secret,
-            host=config.host
+            api_key_id=config.api_key_id,
+            api_key_secret=config.api_secret_key_id,
+            host=config.hostname
         )
 
     @classmethod
     def create(cls, config_dict: Dict, ctx: PipelineContext) -> "SodaSource":
         config = SodaSourceConfig.parse_obj(config_dict)
         return cls(config, ctx)
+
+    def get_platform_info(self, dataset: SodaDataset) -> Dict[str, str]:
+        if dataset.datasource:
+            datasource_name = dataset.datasource[
+                "name"
+            ] if isinstance(dataset.datasource, dict) else dataset.datasource.name
+            datasource_type = dataset.datasource[
+                "type"
+            ] if isinstance(dataset.datasource, dict) else dataset.datasource.type
+
+            source_info = self.config.source_mapping.get(datasource_name)
+            if source_info:
+                return {
+                    "platform": datasource_type,
+                    "platform_instance": source_info.platform_instance or None,
+                    "env": source_info.env or self.config.env,
+                }
+
+        # If no mapping is present or datasource is None, use default values
+        return {
+            "platform": dataset.datasource['type'] if isinstance(
+                dataset.datasource,
+                dict,
+            ) and 'type' in dataset.datasource
+            else "external",
+            "platform_instance": self.config.platform_instance or None,
+            "env": self.config.env,
+        }
 
     def get_workunits(self) -> Iterable[MetadataWorkUnit]:
         try:
@@ -458,7 +531,6 @@ class SodaSource(Source):
                 if isinstance(check, dict):
                     check = SodaCheck.from_dict(check)
 
-                # Ensure all datasets in check.datasets are SodaDataset objects
                 check_datasets = [
                     SodaDataset.from_dict(dataset)
                     if isinstance(dataset, dict)
@@ -475,7 +547,6 @@ class SodaSource(Source):
                     ],
                 )
 
-                # Create a lookup for check results by dataset_id
                 check_results_lookup = {
                     result.dataset_id: result
                     for result in check_results.data
@@ -494,13 +565,14 @@ class SodaSource(Source):
 
                     self.report.report_dataset_scanned()
 
+                    platform_info = self.get_platform_info(full_dataset)
                     dataset_urn = make_dataset_urn_with_platform_instance(
-                        platform=self.config.platform,
+                        platform=platform_info.get("platform"),
                         name=full_dataset.qualified_name.lower()
-                        if self.config.convert_column_urns_to_lowercase
+                        if self.config.convert_urns_to_lowercase
                         else full_dataset.qualified_name,
-                        platform_instance=self.config.platform_instance,
-                        env=self.config.environment,
+                        platform_instance=platform_info.get("platform_instance", None),
+                        env=platform_info.get("env"),
                     )
 
                     assertion_urn = make_assertion_urn(
@@ -511,7 +583,6 @@ class SodaSource(Source):
                         check=check,
                         dataset_urn=dataset_urn,
                         assertion_urn=assertion_urn,
-                        dataset=full_dataset,
                     )
 
                     check_result = check_results_lookup.get(check_dataset.id)
@@ -531,13 +602,11 @@ class SodaSource(Source):
             check: SodaCheck,
             dataset_urn: str,
             assertion_urn: str,
-            dataset: SodaDataset,
     ) -> Iterable[MetadataWorkUnit]:
         try:
             assertion_info = self._create_assertion_info(
                 check=check,
                 dataset_urn=dataset_urn,
-                dataset=dataset,
             )
 
             mcp = MetadataChangeProposalWrapper(
@@ -563,7 +632,6 @@ class SodaSource(Source):
         self,
         check: SodaCheck,
         dataset_urn: str,
-        dataset: SodaDataset,
     ) -> AssertionInfoClass:
         custom_properties = {
             "soda_check_id": check.id,
@@ -639,25 +707,26 @@ class SodaSource(Source):
             dataset_urn: str,
     ) -> AssertionRunEventClass:
 
-        def stringify_dict(obj: Any) -> Dict[str, str]:
+        def flatten_and_stringify(obj: Any, parent_key: str = '') -> Dict[str, str]:
+            items = {}
             if isinstance(obj, dict):
-                return {
-                    str(k): stringify_dict(v)
-                    for k, v in obj.items()
-                }
+                for k, v in obj.items():
+                    new_key = f"{parent_key}.{k}" if parent_key else k
+                    items.update(flatten_and_stringify(v, new_key))
             elif isinstance(obj, list):
-                return {
-                    str(i): stringify_dict(v)
-                    for i, v in enumerate(obj)
-                }
-            elif isinstance(obj, (int, float, bool)):
-                return str(obj)
-            elif obj is None:
-                return "None"
+                for i, v in enumerate(obj):
+                    new_key = f"{parent_key}[{i}]"
+                    items.update(flatten_and_stringify(v, new_key))
             else:
-                return str(obj)
+                items[parent_key] = str(obj) if obj is not None else ""
+            return items
 
-        native_results = stringify_dict(result.to_dict())
+        native_results = flatten_and_stringify(result.to_dict())
+
+        partition_spec = PartitionSpecClass(
+            type=PartitionTypeClass.FULL_TABLE,
+            partition="FULL_TABLE_SNAPSHOT"
+        )
 
         return AssertionRunEventClass(
             timestampMillis=int(
@@ -674,6 +743,7 @@ class SodaSource(Source):
                 nativeResults=native_results,
             ),
             status=AssertionRunStatusClass.COMPLETE,
+            partitionSpec=partition_spec,
         )
 
     def get_report(self):
